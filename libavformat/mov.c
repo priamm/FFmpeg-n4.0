@@ -1892,8 +1892,14 @@ static int mov_read_glbl(MOVContext *c, AVIOContext *pb, MOVAtom atom)
         if (type == MKTAG('f','i','e','l') && size == atom.size)
             return mov_read_default(c, pb, atom);
     }
+    c->has_extradata = 1;
     if (st->codecpar->extradata_size > 1 && st->codecpar->extradata) {
-        av_log(c, AV_LOG_WARNING, "ignoring multiple glbl\n");
+        if (c->allow_multi_extradata) {
+            av_log(c, AV_LOG_WARNING, "found multiple glbl\n");
+        } else {
+            av_log(c, AV_LOG_WARNING, "ignoring multiple glbl\n");
+            return 0;
+        }
         return 0;
     }
     av_freep(&st->codecpar->extradata);
@@ -6953,8 +6959,13 @@ static int mov_read_header(AVFormatContext *s)
 static AVIndexEntry *mov_find_next_sample(AVFormatContext *s, AVStream **st)
 {
     AVIndexEntry *sample = NULL;
+    AVIndexEntry *best_dts_sample = NULL;
+    AVIndexEntry *best_pos_sample = NULL;
+    AVStream *best_dts_stream = NULL;
+    AVStream *best_pos_stream = NULL;
     int64_t best_dts = INT64_MAX;
     int i;
+    int64_t pos = avio_tell(s->pb);
     for (i = 0; i < s->nb_streams; i++) {
         AVStream *avst = s->streams[i];
         MOVStreamContext *msc = avst->priv_data;
@@ -6962,17 +6973,36 @@ static AVIndexEntry *mov_find_next_sample(AVFormatContext *s, AVStream **st)
             AVIndexEntry *current_sample = &avst->index_entries[msc->current_sample];
             int64_t dts = av_rescale(current_sample->timestamp, AV_TIME_BASE, msc->time_scale);
             av_log(s, AV_LOG_TRACE, "stream %d, sample %d, dts %"PRId64"\n", i, msc->current_sample, dts);
-            if (!sample || (!(s->pb->seekable & AVIO_SEEKABLE_NORMAL) && current_sample->pos < sample->pos) ||
+            if (!best_dts_sample || (!(s->pb->seekable & AVIO_SEEKABLE_NORMAL) && current_sample->pos < best_dts_sample->pos) ||
                 ((s->pb->seekable & AVIO_SEEKABLE_NORMAL) &&
                  ((msc->pb != s->pb && dts < best_dts) || (msc->pb == s->pb &&
-                 ((FFABS(best_dts - dts) <= AV_TIME_BASE && current_sample->pos < sample->pos) ||
+                 ((FFABS(best_dts - dts) <= AV_TIME_BASE && current_sample->pos < best_dts_sample->pos) ||
                   (FFABS(best_dts - dts) > AV_TIME_BASE && dts < best_dts)))))) {
-                sample = current_sample;
+                /* find best dts sample */
+                best_dts_sample = current_sample;
                 best_dts = dts;
-                *st = avst;
+                best_dts_stream = avst;
+            }
+            if (current_sample->pos >= pos &&
+                (!best_pos_sample || current_sample->pos < best_pos_sample->pos)) {
+                /* find nearest sample to avoid seek around */
+                best_pos_sample = current_sample;
+                best_pos_stream = avst;
             }
         }
     }
+
+    if (best_dts_sample && best_dts_sample != best_pos_sample &&
+        (!best_pos_sample ||
+         best_dts_sample->pos < pos ||
+         best_dts_sample->pos > pos + 1024 * 1024)) {
+        sample = best_dts_sample;
+        *st = best_dts_stream;
+    } else {
+        sample = best_pos_sample;
+        *st = best_pos_stream;
+    }
+
     return sample;
 }
 
@@ -7162,6 +7192,12 @@ static int mov_read_packet(AVFormatContext *s, AVPacket *pkt)
                 return ret;
         }
     }
+    if (mov->allow_multi_extradata && mov->has_extradata) {
+        mov->has_extradata = 0;
+        ret = mov_change_extradata(sc, pkt);
+        if (ret < 0)
+            return ret;
+    }
 
     if (mov->aax_mode)
         aax_filter(pkt->data, pkt->size, mov);
@@ -7343,6 +7379,8 @@ static const AVOption mov_options[] = {
     { "enable_drefs", "Enable external track support.", OFFSET(enable_drefs), AV_OPT_TYPE_BOOL,
         {.i64 = 0}, 0, 1, FLAGS },
 
+    {"allow_multi_extradata", "", OFFSET(allow_multi_extradata), AV_OPT_TYPE_BOOL, {.i64 = 0},
+        0, 1, FLAGS},
     { NULL },
 };
 
